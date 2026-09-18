@@ -1,0 +1,27 @@
+# gorpe-mcp configuration
+# Copy to config.yaml and adjust paths for your environment.
+
+# mTLS client certificate used for all gorpe calls.
+# Defaults (when omitted) point to /etc/gorpe/ssl/{cert,key,ca}.pem.
+#cert: /etc/gorpe/ssl/cert.pem
+#key:  /etc/gorpe/ssl/key.pem
+
+# CA bundle — used only for gorpe daemons that verify the client against an
+# explicit ca_file. gorpe-mcp itself does not verify the gorpe server cert
+# (gorpe daemons may use self-signed certs), matching check_gorpe behaviour.
+#ca: /etc/gorpe/ssl/ca.pem
+
+# Per-user host restrictions (fnmatch glob patterns).
+# Users absent from this map are unrestricted.
+# access_policy:
+#   alice:
+#     allowed_hosts:
+#       - "*.prod.example.com"
+#   bob:
+#     allowed_hosts:
+#       - "web*.example.com"
+#       - "db*.example.com"
+
+# Listen address and port (can be overridden by --host/--port CLI args)
+#host: 0.0.0.0
+#port: 8083

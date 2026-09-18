@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "gorpe-mcp"
+version = "0.1.0"
+description = "MCP server for gorpe remote command execution"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.6",
+    "uvicorn>=0.30",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+gorpe-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["server"]
