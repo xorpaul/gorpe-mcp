@@ -22,6 +22,18 @@
 #       - "web*.example.com"
 #       - "db*.example.com"
 
+# Command catalog returned by gorpe_list_commands(). Without these keys a
+# built-in catalog of generic gorpe commands is used. Replace it with your
+# own command set, intent → command mapping and proxy routing, either inline
+# or from a file (inline `catalog` wins).
+#catalog_file: /etc/gorpe-mcp/catalog.md
+#catalog: |
+#  # Gorpe command catalog
+#  ## Proxy routing (use gorpe_run_via_proxy monitoring_server=...)
+#    monitoring1.example.com — datacenter A
+#  ## Commands
+#    run_puppet_agent — puppet agent run
+
 # Listen address and port (can be overridden by --host/--port CLI args)
 #host: 0.0.0.0
 #port: 8083

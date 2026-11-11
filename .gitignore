@@ -3,3 +3,5 @@ config.yaml
 __pycache__/
 *.pyc
 .venv/
+build/
+*.egg-info/

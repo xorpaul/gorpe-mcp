@@ -7,6 +7,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import socket
 import ssl
 import sys
@@ -104,17 +105,18 @@ def _resolve_paths(config: dict) -> tuple[str, str, str]:
     return cert, key, ca
 
 
-def _gorpe_request(host: str, port: int, command: str, arg: str) -> tuple[int, str]:
+def _gorpe_request(host: str, port: int, command: str, arg: str) -> tuple[int, str, str]:
     """Make a direct mTLS HTTPS request to a gorpe daemon, requesting JSON output.
 
     Falls back to parsing the legacy text protocol ("Result Code: N") if the
     daemon has not yet been updated to support Accept: application/json.
+    Returns (exit_code, output, stderr); stderr is "" unless the daemon sends it
+    separately (gorpe JSON mode, newer daemons only).
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
-    # gorpe daemons may use self-signed certs; skip server cert verification
-    # and rely on mTLS client cert for authentication, matching check_gorpe's
-    # InsecureSkipVerify = true behaviour.
+    # gorpe daemons may use self-signed certs; match check_gorpe's
+    # InsecureSkipVerify = true behaviour and rely on mTLS for authentication.
     ctx.verify_mode = ssl.CERT_NONE
     ctx.load_cert_chain(_cert, _key)
 
@@ -136,7 +138,7 @@ def _gorpe_request(host: str, port: int, command: str, arg: str) -> tuple[int, s
 
         if "application/json" in content_type:
             data = json.loads(body_bytes.decode())
-            return data["exit_code"], data["output"].rstrip("\n")
+            return data["exit_code"], data["output"].rstrip("\n"), (data.get("stderr") or "").rstrip("\n")
 
         # Fallback: old-style text protocol — "...\nResult Code: N\n"
         text = body_bytes.decode()
@@ -147,15 +149,15 @@ def _gorpe_request(host: str, port: int, command: str, arg: str) -> tuple[int, s
         else:
             rc = 3
             output = text
-        return rc, output.strip()
+        return rc, output.strip(), ""
 
     except OSError as e:
-        return 3, f"connection error: {e}"
+        return 3, f"connection error: {e}", ""
     except Exception as e:
-        return 3, f"error: {e}"
+        return 3, f"error: {e}", ""
 
 
-def _run(host: str, command: str, arg: str | None, proxy: str | None) -> tuple[int, str]:
+def _run(host: str, command: str, arg: str | None, proxy: str | None) -> tuple[int, str, str]:
     """Run a gorpe command, optionally via a run_gorpe_proxy hop."""
     if proxy:
         proxy_arg = f"{host} {command}"
@@ -175,15 +177,74 @@ _PUPPET_EXIT = {
 _PUPPET_CMDS = {"run_puppet_agent", "run_puppet_agent_noop", "run_puppet_agent_wild"}
 
 
-def _make_result(rc: int, output: str, command: str) -> str:
-    result: dict = {"exit_code": rc, "output": output if output else ""}
+DEFAULT_MAX_BYTES = 64 * 1024
+
+
+def _shape_output(output: str, grep: str, exclude: str, head_lines: int, tail_lines: int,
+                  max_bytes: int, keep: str) -> dict:
+    """Filter and bound command output so large journals don't flood the caller's context.
+
+    Applied in order: grep (keep matching lines), exclude (drop matching lines),
+    head_lines/tail_lines, then max_bytes (keeping the start or end per `keep`).
+    """
+    lines = output.split("\n") if output else []
+    info: dict = {"total_lines": len(lines), "total_bytes": len(output.encode())}
+    try:
+        if grep:
+            rx = re.compile(grep)
+            lines = [line for line in lines if rx.search(line)]
+        if exclude:
+            rx = re.compile(exclude)
+            lines = [line for line in lines if not rx.search(line)]
+    except re.error as e:
+        info["filter_error"] = f"invalid regex: {e}"
+        return {"output": "", **info}
+    if head_lines > 0:
+        lines = lines[:head_lines]
+    if tail_lines > 0:
+        lines = lines[-tail_lines:]
+    shaped = "\n".join(lines)
+    truncated = False
+    if max_bytes > 0:
+        raw = shaped.encode()
+        if len(raw) > max_bytes:
+            truncated = True
+            raw = raw[:max_bytes] if keep == "start" else raw[-max_bytes:]
+            shaped = raw.decode(errors="ignore")
+    info["truncated"] = truncated
+    return {"output": shaped, **info}
+
+
+def _make_result(rc: int, output: str, command: str, grep: str = "", exclude: str = "",
+                 head_lines: int = 0, tail_lines: int = 0, max_bytes: int = DEFAULT_MAX_BYTES,
+                 keep: str = "end", stderr: str = "") -> dict:
+    result: dict = {"exit_code": rc}
     if command in _PUPPET_CMDS and rc in _PUPPET_EXIT:
         result["exit_meaning"] = _PUPPET_EXIT[rc]
-    return json.dumps(result)
+    result.update(_shape_output(output or "", grep, exclude, head_lines, tail_lines, max_bytes, keep))
+    if stderr:
+        # stderr is already part of "output"; repeat it on its own (exclude and
+        # max_bytes applied, no grep/line limits) so errors aren't lost to filtering.
+        err = _shape_output(stderr, "", exclude, 0, 0, max_bytes, keep)
+        result["stderr"] = err["output"]
+        if err.get("truncated"):
+            result["stderr_truncated"] = True
+    return result
+
+
+
+def _run_and_shape(host: str, command: str, arg: str | None, proxy: str | None, cmd_name: str,
+                   *shaping) -> dict:
+    """Run the gorpe call and shape its output in the worker thread, so a big
+    output or slow regex never blocks the event loop for other callers."""
+    rc, output, stderr = _run(host, command, arg, proxy)
+    return _make_result(rc, output, cmd_name, *shaping, stderr=stderr)
 
 
 mcp = FastMCP("gorpe-mcp")
 
+# Built-in catalog of generic gorpe commands. Sites with their own command set
+# replace it with `catalog` or `catalog_file` in config.yaml.
 _COMMAND_CATALOG = """\
 # Gorpe command catalog
 
@@ -397,7 +458,9 @@ def gorpe_list_commands() -> str:
 
 
 @mcp.tool()
-async def gorpe_run(host: str, command: str, arg: str = "") -> str:
+async def gorpe_run(host: str, command: str, arg: str = "", grep: str = "", exclude: str = "",
+                    head_lines: int = 0, tail_lines: int = 0, max_bytes: int = DEFAULT_MAX_BYTES,
+                    keep: str = "end") -> dict:
     """Run a gorpe command on a remote host using the server's mTLS client certificate.
 
     Call gorpe_list_commands() first if you are unsure which command to use.
@@ -411,7 +474,21 @@ async def gorpe_run(host: str, command: str, arg: str = "") -> str:
     arg: argument for commands that take $ARG$ (e.g. unit name for check_journalctl_unit).
       Leave empty for arg-less commands.
 
-    Returns JSON: {"exit_code": N, "output": "...", "exit_meaning": "..."}.
+    Output shaping (applied by gorpe-mcp after the command runs, in this order):
+      grep: regex; keep only matching lines (Python re syntax, e.g. "error|warn").
+        Use this instead of trying to pipe to grep — gorpe never runs a shell, and it rejects
+        | ' " etc. in arg except for run_journalctl_wild/run_grep_wild/run_gorpe_proxy on
+        gorpe > v2.4.0. A rejection names the offending character.
+      exclude: regex; drop matching lines (e.g. "sudo\\[" to hide gorpe's own sudo audit lines).
+      head_lines / tail_lines: keep only the first / last N lines (0 = all).
+      max_bytes: cap on returned output (default 65536; 0 = unlimited).
+      keep: "end" (default, keeps the newest log lines / puppet errors) or "start".
+
+    Returns {"exit_code": N, "output": "...", "exit_meaning": "..." (puppet only),
+      "truncated": bool, "total_lines": N, "total_bytes": N, "filter_error": "..." (bad regex only),
+      "stderr": "..." (only when non-empty and the target gorpe is new enough; not via proxy)}.
+      total_* describe the raw output before shaping. "output" is stdout+stderr interleaved;
+      "stderr" repeats just the stderr part (unaffected by grep/head_lines/tail_lines).
     Exit code notes for run_puppet_agent:
       0 = no changes (catalog already applied)
       2 = changes applied successfully (NOT an error)
@@ -423,41 +500,79 @@ async def gorpe_run(host: str, command: str, arg: str = "") -> str:
     denied = _check_access(user, host)
     if denied:
         logger.warning("[%s] gorpe_run DENIED host=%s command=%s: %s", user, host, command, denied)
-        return json.dumps({"exit_code": 3, "output": denied})
+        return {"exit_code": 3, "output": denied}
     logger.info("[%s] gorpe_run host=%s command=%s arg=%r", user, host, command, arg or "")
     loop = asyncio.get_running_loop()
-    rc, output = await loop.run_in_executor(None, functools.partial(_run, host, command, arg or None, None))
+    result = await loop.run_in_executor(None, functools.partial(
+        _run_and_shape, host, command, arg or None, None, command, grep, exclude, head_lines, tail_lines, max_bytes, keep))
+    rc = result["exit_code"]
     logger.info("[%s] gorpe_run host=%s command=%s -> exit %d", user, host, command, rc)
-    return _make_result(rc, output, command)
+    return result
 
 
 @mcp.tool()
-async def gorpe_run_via_proxy(monitoring_server: str, target_host: str, command: str, arg: str = "") -> str:
+async def gorpe_run_via_proxy(monitoring_server: str, target_host: str, command: str, arg: str = "",
+                              grep: str = "", exclude: str = "", head_lines: int = 0, tail_lines: int = 0,
+                              max_bytes: int = DEFAULT_MAX_BYTES, keep: str = "end") -> dict:
     """Run a gorpe command via a monitoring-server proxy (run_gorpe_proxy hop).
 
     Use when direct port 5667 access from this server to the target is blocked by a firewall.
     The request hops: this server → monitoring server gorpe → target gorpe.
 
     monitoring_server: FQDN of a host that has port 5667 access to the target and has
-      run_gorpe_proxy in its gorpe.yaml commands list.
+      run_gorpe_proxy in its gorpe.yaml commands list (see gorpe_list_commands for
+      site-specific proxy routing).
     target_host: FQDN or IP of the actual target.
     command: gorpe command on the target (same options as gorpe_run).
     arg: optional argument for the target command.
 
-    Returns JSON: {"exit_code": N, "output": "...", "exit_meaning": "..."}.
+    Output shaping (applied by gorpe-mcp after the command runs, in this order):
+      grep: regex; keep only matching lines (Python re syntax, e.g. "error|warn").
+        Use this instead of trying to pipe to grep — gorpe never runs a shell, and it rejects
+        | ' " etc. in arg except for run_journalctl_wild/run_grep_wild/run_gorpe_proxy on
+        gorpe > v2.4.0. A rejection names the offending character.
+      exclude: regex; drop matching lines (e.g. "sudo\\[" to hide gorpe's own sudo audit lines).
+      head_lines / tail_lines: keep only the first / last N lines (0 = all).
+      max_bytes: cap on returned output (default 65536; 0 = unlimited).
+      keep: "end" (default, keeps the newest log lines / puppet errors) or "start".
+
+    Returns {"exit_code": N, "output": "...", "exit_meaning": "..." (puppet only),
+      "truncated": bool, "total_lines": N, "total_bytes": N, "filter_error": "..." (bad regex only),
+      "stderr": "..." (only when non-empty and the target gorpe is new enough; not via proxy)}.
+      total_* describe the raw output before shaping. "output" is stdout+stderr interleaved;
+      "stderr" repeats just the stderr part (unaffected by grep/head_lines/tail_lines).
     """
     user = _current_user.get()
     denied = _check_access(user, target_host)
     if denied:
         logger.warning("[%s] gorpe_run_via_proxy DENIED host=%s command=%s: %s", user, target_host, command, denied)
-        return json.dumps({"exit_code": 3, "output": denied})
+        return {"exit_code": 3, "output": denied}
     logger.info("[%s] gorpe_run_via_proxy proxy=%s host=%s command=%s arg=%r",
                 user, monitoring_server, target_host, command, arg or "")
     loop = asyncio.get_running_loop()
-    rc, output = await loop.run_in_executor(None, functools.partial(_run, target_host, command, arg or None, monitoring_server))
+    result = await loop.run_in_executor(None, functools.partial(
+        _run_and_shape, target_host, command, arg or None, monitoring_server, command, grep, exclude, head_lines, tail_lines, max_bytes, keep))
+    rc = result["exit_code"]
     logger.info("[%s] gorpe_run_via_proxy proxy=%s host=%s command=%s -> exit %d",
                 user, monitoring_server, target_host, command, rc)
-    return _make_result(rc, output, command)
+    return result
+
+
+def _load_catalog(config: dict, default: str) -> str:
+    """Return the command catalog: `catalog` (inline text) or `catalog_file`
+    from the config, else the built-in generic catalog."""
+    if config.get("catalog"):
+        logger.info("using command catalog from config")
+        return config["catalog"]
+    path = config.get("catalog_file")
+    if path:
+        try:
+            with open(path) as f:
+                logger.info("using command catalog: %s", path)
+                return f.read()
+        except OSError as e:
+            logger.warning("catalog_file %s not readable (%s), using built-in catalog", path, e)
+    return default
 
 
 def main():
@@ -468,10 +583,12 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
     config = _load_config(args.config)
 
-    global _cert, _key, _ca, _access_policy
+    global _cert, _key, _ca, _access_policy, _COMMAND_CATALOG
     _cert, _key, _ca = _resolve_paths(config)
+    _COMMAND_CATALOG = _load_catalog(config, _COMMAND_CATALOG)
     _access_policy = {
         user: entry["allowed_hosts"]
         for user, entry in config.get("access_policy", {}).items()
@@ -479,8 +596,6 @@ def main():
     if _access_policy:
         for user, patterns in _access_policy.items():
             logger.info("access policy: %s restricted to %s", user, ", ".join(patterns))
-
-    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
     for path, label in [(_cert, "cert"), (_key, "key"), (_ca, "ca")]:
         if not os.path.exists(path):

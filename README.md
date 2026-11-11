@@ -10,7 +10,7 @@ To restrict which callers can reach the MCP server, run it behind an authenticat
 
 ## Tools
 
-### `gorpe_run(host, command, arg="")`
+### `gorpe_run(host, command, arg="", grep="", exclude="", head_lines=0, tail_lines=0, max_bytes=65536, keep="end")`
 
 Run any gorpe command directly against a target host.
 
@@ -47,7 +47,19 @@ Common commands:
 | `run_nft_list` | — | nftables ruleset. |
 | `run_dmesg` | — | Kernel ring buffer. |
 
-Call `gorpe_list_commands()` for the full catalog with intent→command mapping.
+Call `gorpe_list_commands()` for the full catalog with intent→command mapping. Sites can replace the built-in catalog with their own (see `catalog` / `catalog_file` below).
+
+**Output shaping** (applied by gorpe-mcp after the command ran, in this order) keeps large outputs out of the caller's context:
+
+| Parameter | Effect |
+|---|---|
+| `grep` | Regex (Python `re`), keep only matching lines. Use this instead of piping: gorpe never runs a shell. |
+| `exclude` | Regex, drop matching lines. |
+| `head_lines` / `tail_lines` | Keep only the first / last N lines (`0` = all). |
+| `max_bytes` | Cap on the returned output, default 64 KiB (`0` = unlimited). |
+| `keep` | `"end"` (default, newest log lines) or `"start"` when `max_bytes` cuts. |
+
+The result is a JSON object: `exit_code`, `output`, `exit_meaning` (puppet commands only), `truncated`, `total_lines` / `total_bytes` (raw output before shaping), `filter_error` (invalid regex only) and `stderr` (only when non-empty and the target gorpe sends it separately; not via proxy). `output` is stdout and stderr interleaved; `stderr` repeats only the stderr part, unaffected by `grep` and line limits.
 
 **Puppet exit code interpretation** (applied automatically to `run_puppet_agent*`):
 
@@ -59,7 +71,9 @@ Call `gorpe_list_commands()` for the full catalog with intent→command mapping.
 | 6 | Changes applied AND failures |
 | 3 | Transport error (connection refused, TLS failure) |
 
-### `gorpe_run_via_proxy(monitoring_server, target_host, command, arg="")`
+### `gorpe_run_via_proxy(monitoring_server, target_host, command, arg="", ...)`
+
+Takes the same output-shaping parameters as `gorpe_run`.
 
 Hop through a monitoring server when direct port 5667 access to the target is blocked by a firewall. The call chain is: MCP server → monitoring server gorpe (`run_gorpe_proxy`) → target gorpe.
 
@@ -136,6 +150,8 @@ Replace `USER`, `PASSWORD`, and the URL with your own values. Verify with `claud
 
 All config keys are optional — defaults point to `/etc/gorpe/ssl/{cert,key,ca}.pem`.
 
+The built-in command catalog describes generic gorpe commands. If your gorpe daemons define their own command set, put a curated catalog (intent → command mapping, commands and their args, and proxy routing: which monitoring server reaches which network) into `catalog` or `catalog_file`, so AI callers pick the right command and proxy.
+
 | Key | Default | Description |
 |---|---|---|
 | `cert` | `/etc/gorpe/ssl/cert.pem` | mTLS client certificate |
@@ -144,6 +160,8 @@ All config keys are optional — defaults point to `/etc/gorpe/ssl/{cert,key,ca}
 | `host` | `0.0.0.0` | Listen address (overridden by `--host`) |
 | `port` | `8083` | Listen port (overridden by `--port`) |
 | `access_policy` | — | Per-user host restrictions (fnmatch glob patterns) |
+| `catalog` | — | Inline command catalog returned by `gorpe_list_commands()`, replacing the built-in one |
+| `catalog_file` | — | Path to a command catalog file (used when `catalog` is not set; falls back to the built-in catalog if unreadable) |
 
 The gorpe server cert is **not** verified — gorpe daemons may use self-signed certs. Authentication is provided by the mTLS client certificate.
 
