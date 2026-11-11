@@ -4,7 +4,7 @@ Status: not implemented. gorpe v2.6.0 and newer can compress responses; gorpe-mc
 
 ## Background
 
-From v2.6.0 on, gorpe gzips a response (`gzip.BestSpeed`) when the request has `Accept-Encoding: gzip` and the body is at least `compress_min_bytes` (default 1024, `0` = off). It then sets `Content-Encoding: gzip` and `Vary: Accept-Encoding`. Smaller bodies and clients that don't send the header get plain responses as before. See the [gorpe v2.6.0 CHANGELOG](https://github.com/xorpaul/gorpe/blob/master/CHANGELOG.md).
+From v2.6.0 on, gorpe gzips a response (`gzip.BestSpeed`) when the request has `Accept-Encoding: gzip` and the body is at least `compress_min_bytes` (default 1024, `0` = off). It then sets `Content-Encoding: gzip` and `Vary: Accept-Encoding`. Smaller bodies and clients that don't send the header get plain responses as before. See the [gorpe v2.6.0 CHANGELOG](https://github.com/xorpaul/gorpe/blob/master/CHANGELOG.md#v260---2026-11-11).
 
 `check_gorpe` and Icinga use Go's `net/http`, which requests and decodes gzip automatically, so they benefit with no change. gorpe-mcp uses Python's `http.client`, which does neither. So today every response gorpe-mcp receives is uncompressed, including the large ones it exists for: journal tails, `cat`/`grep` of files, and JSON documents.
 
