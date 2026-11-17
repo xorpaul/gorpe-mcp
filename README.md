@@ -160,6 +160,7 @@ The built-in command catalog describes generic gorpe commands. If your gorpe dae
 | `host` | `0.0.0.0` | Listen address (overridden by `--host`) |
 | `port` | `8083` | Listen port (overridden by `--port`) |
 | `access_policy` | — | Per-user host restrictions (fnmatch glob patterns) |
+| `hostname_filters` | — | List of `{pattern, message}` entries (fnmatch globs). Matching hosts return `matches hostname filter` plus `message` as `info` immediately, without a network call |
 | `catalog` | — | Inline command catalog returned by `gorpe_list_commands()`, replacing the built-in one |
 | `catalog_file` | — | Path to a command catalog file (used when `catalog` is not set; falls back to the built-in catalog if unreadable) |
 

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.0] - 2026-11-17
+
+### Added
+
+- **`hostname_filters`** config option: hosts matching a glob pattern (e.g. `*foo*.domain.tld`) return `matches hostname filter` plus a custom `info` message immediately, without any network call. Applies to the target host of `gorpe_run` and `gorpe_run_via_proxy` and is checked before `access_policy`.
+- Unit tests for the hostname filter (`tests/test_hostname_filter.py`).
+
 ## [v0.2.0] - 2026-11-11
 
 ### Added

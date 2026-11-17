@@ -22,6 +22,13 @@
 #       - "web*.example.com"
 #       - "db*.example.com"
 
+# Hostname filters (fnmatch glob patterns). A host matching a pattern is
+# rejected immediately, without contacting it, with the output
+# "matches hostname filter" plus the custom message as "info".
+# hostname_filters:
+#   - pattern: "*foo*.domain.tld"
+#     message: "These hosts do not have gorpe configured and can not be queried"
+
 # Command catalog returned by gorpe_list_commands(). Without these keys a
 # built-in catalog of generic gorpe commands is used. Replace it with your
 # own command set, intent → command mapping and proxy routing, either inline

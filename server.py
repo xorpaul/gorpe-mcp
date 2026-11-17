@@ -41,6 +41,27 @@ def _check_access(user: str, host: str) -> str | None:
     )
 
 
+# hostname_filters from config: [(glob_pattern, info_message), ...]
+# Hosts matching a pattern are rejected immediately without any network call.
+_hostname_filters: list[tuple[str, str]] = []
+
+
+def _parse_hostname_filters(entries) -> list[tuple[str, str]]:
+    """Convert the hostname_filters config list into (pattern, message) tuples."""
+    return [(entry["pattern"], entry.get("message", "")) for entry in (entries or [])]
+
+
+def _check_hostname_filter(host: str) -> dict | None:
+    """Return a result dict if host matches a configured filter, else None."""
+    for pattern, message in _hostname_filters:
+        if fnmatch.fnmatch(host, pattern):
+            result: dict = {"exit_code": 3, "output": "matches hostname filter"}
+            if message:
+                result["info"] = message
+            return result
+    return None
+
+
 # IP → hostname cache; populated on first request from each client.
 _dns_cache: dict[str, str] = {}
 
@@ -497,6 +518,10 @@ async def gorpe_run(host: str, command: str, arg: str = "", grep: str = "", excl
     exit_code 3 for any command = transport/connection error.
     """
     user = _current_user.get()
+    filtered = _check_hostname_filter(host)
+    if filtered:
+        logger.info("[%s] gorpe_run host=%s command=%s matches hostname filter", user, host, command)
+        return filtered
     denied = _check_access(user, host)
     if denied:
         logger.warning("[%s] gorpe_run DENIED host=%s command=%s: %s", user, host, command, denied)
@@ -543,6 +568,10 @@ async def gorpe_run_via_proxy(monitoring_server: str, target_host: str, command:
       "stderr" repeats just the stderr part (unaffected by grep/head_lines/tail_lines).
     """
     user = _current_user.get()
+    filtered = _check_hostname_filter(target_host)
+    if filtered:
+        logger.info("[%s] gorpe_run_via_proxy host=%s command=%s matches hostname filter", user, target_host, command)
+        return filtered
     denied = _check_access(user, target_host)
     if denied:
         logger.warning("[%s] gorpe_run_via_proxy DENIED host=%s command=%s: %s", user, target_host, command, denied)
@@ -586,13 +615,14 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
     config = _load_config(args.config)
 
-    global _cert, _key, _ca, _access_policy, _COMMAND_CATALOG
+    global _cert, _key, _ca, _access_policy, _hostname_filters, _COMMAND_CATALOG
     _cert, _key, _ca = _resolve_paths(config)
     _COMMAND_CATALOG = _load_catalog(config, _COMMAND_CATALOG)
     _access_policy = {
         user: entry["allowed_hosts"]
         for user, entry in config.get("access_policy", {}).items()
     }
+    _hostname_filters = _parse_hostname_filters(config.get("hostname_filters"))
     if _access_policy:
         for user, patterns in _access_policy.items():
             logger.info("access policy: %s restricted to %s", user, ", ".join(patterns))
